@@ -1,17 +1,31 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "@aihot/backend/db";
-import type { AttentionWeight, L3Proposal, TaxonomyLevel, TaxonomyNode, TaxonomyStatus } from "../types.ts";
+import type {
+  AttentionWeight,
+  L3Proposal,
+  LifecycleGcDecision,
+  LifecycleStatus,
+  TaxonomyLevel,
+  TaxonomyNode,
+} from "../types.ts";
 
 interface TaxonomyRow {
   id: string;
   parent_id: string | null;
   level: number;
   name: string;
+  name_en: string;
   definition: string;
   include_examples: string[];
   exclude_boundaries: string[];
+  engineering_focus: string;
+  frontier_focus: string;
+  clues: string[];
   attention_weight: AttentionWeight;
-  status: TaxonomyStatus;
+  lifecycle_status: LifecycleStatus;
+  pinned: boolean;
+  merged_into_id: string | null;
+  last_hit_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -22,20 +36,80 @@ function toNode(row: TaxonomyRow): TaxonomyNode {
     parentId: row.parent_id,
     level: row.level as TaxonomyLevel,
     name: row.name,
+    nameEn: row.name_en ?? "",
     definition: row.definition,
     includeExamples: row.include_examples,
     excludeBoundaries: row.exclude_boundaries,
+    engineeringFocus: row.engineering_focus ?? "",
+    frontierFocus: row.frontier_focus ?? "",
+    clues: row.clues ?? [],
     attentionWeight: row.attention_weight,
-    status: row.status,
+    lifecycleStatus: (row.lifecycle_status ?? "active") as LifecycleStatus,
+    pinned: Boolean(row.pinned),
+    mergedIntoId: row.merged_into_id ?? null,
+    lastHitAt: row.last_hit_at?.toISOString() ?? null,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };
 }
 
-export async function listTaxonomyNodes(status: TaxonomyStatus | "all" = "active"): Promise<TaxonomyNode[]> {
-  const rows = status === "all"
-    ? await sql<TaxonomyRow[]>`SELECT * FROM tech_taxonomy_nodes ORDER BY level ASC, name ASC`
-    : await sql<TaxonomyRow[]>`SELECT * FROM tech_taxonomy_nodes WHERE status = ${status} ORDER BY level ASC, name ASC`;
+export interface LifecyclePolicy {
+  /** Days an `incubating` L3 has to prove sustained signal before graduating or sleeping. */
+  incubatingTrialDays: number;
+  /** Minimum high-value hits during trial to graduate to `active`. */
+  incubatingMinHits: number;
+  /** Days of silence before an unpinned `active` L3 automatically moves to `dormant`. */
+  activeSilentDaysToDormant: number;
+  /** Soft cap of active L3 nodes per L2 branch to prevent unbounded sprawl. */
+  maxActiveL3PerL2: number;
+}
+
+export const DEFAULT_LIFECYCLE_POLICY: LifecyclePolicy = {
+  incubatingTrialDays: 45,
+  incubatingMinHits: 3,
+  activeSilentDaysToDormant: 75,
+  maxActiveL3PerL2: 8,
+};
+
+/**
+ * Pure lifecycle GC decision function for L3 topics:
+ * - Never touches L1/L2 (governed by humans) or `pinned` strategic L3 topics.
+ * - Graduates `incubating` topics with sustained hits -> `active`; puts silent ones -> `dormant`.
+ * - Automatically cools down unpinned `active` topics with prolonged silence -> `dormant` (soft delete from recall).
+ */
+export function evaluateLifecycleTransition(input: {
+  level: TaxonomyLevel;
+  lifecycleStatus: LifecycleStatus;
+  pinned: boolean;
+  daysSinceCreated: number;
+  daysSinceLastHit: number;
+  recentHighValueHits: number;
+}, policy: LifecyclePolicy = DEFAULT_LIFECYCLE_POLICY): LifecycleStatus | null {
+  if (input.level !== 3) return null;
+  if (input.lifecycleStatus === "retired") return null;
+
+  if (input.lifecycleStatus === "incubating") {
+    if (input.recentHighValueHits >= policy.incubatingMinHits) return "active";
+    if (!input.pinned && input.daysSinceCreated >= policy.incubatingTrialDays) return "dormant";
+    return null;
+  }
+
+  if (input.lifecycleStatus === "active") {
+    if (!input.pinned && input.daysSinceLastHit >= policy.activeSilentDaysToDormant) return "dormant";
+    return null;
+  }
+
+  if (input.lifecycleStatus === "dormant" && input.recentHighValueHits >= 2) {
+    return "incubating";
+  }
+
+  return null;
+}
+
+export async function listTaxonomyNodes(filter: LifecycleStatus | "all" = "active"): Promise<TaxonomyNode[]> {
+  const rows = filter === "all"
+    ? await sql<TaxonomyRow[]>`SELECT * FROM tech_taxonomy_nodes ORDER BY level ASC, id ASC`
+    : await sql<TaxonomyRow[]>`SELECT * FROM tech_taxonomy_nodes WHERE lifecycle_status = ${filter} ORDER BY level ASC, id ASC`;
   return rows.map(toNode);
 }
 
@@ -44,30 +118,95 @@ export async function upsertTaxonomyNode(input: {
   parentId: string | null;
   level: TaxonomyLevel;
   name: string;
+  nameEn?: string;
   definition: string;
   includeExamples: string[];
   excludeBoundaries: string[];
+  engineeringFocus?: string;
+  frontierFocus?: string;
+  clues?: string[];
   attentionWeight: AttentionWeight;
-  status?: TaxonomyStatus;
+  lifecycleStatus?: LifecycleStatus;
+  pinned?: boolean;
 }): Promise<TaxonomyNode> {
   const id = input.id ?? `tax_${randomUUID().slice(0, 8)}`;
-  const status = input.status ?? "active";
+  const lifecycle = input.lifecycleStatus ?? "active";
+  const legacyStatus = lifecycle === "retired" || lifecycle === "dormant" ? "archived" : lifecycle === "proposed" ? "proposed" : "active";
   const [row] = await sql<TaxonomyRow[]>`
-    INSERT INTO tech_taxonomy_nodes (id, parent_id, level, name, definition, include_examples, exclude_boundaries, attention_weight, status)
-    VALUES (${id}, ${input.parentId}, ${input.level}, ${input.name}, ${input.definition},
-            ${input.includeExamples}, ${input.excludeBoundaries}, ${input.attentionWeight}, ${status})
+    INSERT INTO tech_taxonomy_nodes (
+      id, parent_id, level, name, name_en, definition,
+      include_examples, exclude_boundaries, engineering_focus, frontier_focus, clues,
+      attention_weight, status, lifecycle_status, pinned
+    )
+    VALUES (
+      ${id}, ${input.parentId}, ${input.level}, ${input.name}, ${input.nameEn ?? ""}, ${input.definition},
+      ${input.includeExamples}, ${input.excludeBoundaries}, ${input.engineeringFocus ?? ""}, ${input.frontierFocus ?? ""}, ${input.clues ?? []},
+      ${input.attentionWeight}, ${legacyStatus}, ${lifecycle}, ${Boolean(input.pinned)}
+    )
     ON CONFLICT (id) DO UPDATE SET
       parent_id = EXCLUDED.parent_id,
       level = EXCLUDED.level,
       name = EXCLUDED.name,
+      name_en = EXCLUDED.name_en,
       definition = EXCLUDED.definition,
       include_examples = EXCLUDED.include_examples,
       exclude_boundaries = EXCLUDED.exclude_boundaries,
+      engineering_focus = EXCLUDED.engineering_focus,
+      frontier_focus = EXCLUDED.frontier_focus,
+      clues = EXCLUDED.clues,
       attention_weight = EXCLUDED.attention_weight,
       status = EXCLUDED.status,
+      lifecycle_status = EXCLUDED.lifecycle_status,
+      pinned = EXCLUDED.pinned,
       updated_at = now()
     RETURNING *`;
   return toNode(row!);
+}
+
+/**
+ * Periodic Lifecycle GC: cools down silent unpinned L3s to `dormant`, graduates proven `incubating` L3s to `active`.
+ */
+export async function runLifecycleGc(now = new Date()): Promise<LifecycleGcDecision[]> {
+  const nodes = await listTaxonomyNodes("all");
+  const decisions: LifecycleGcDecision[] = [];
+
+  for (const node of nodes) {
+    if (node.level !== 3 || node.lifecycleStatus === "retired") continue;
+    const daysSinceCreated = (now.getTime() - new Date(node.createdAt).getTime()) / 86_400_000;
+    const lastRef = node.lastHitAt ? new Date(node.lastHitAt).getTime() : new Date(node.createdAt).getTime();
+    const daysSinceLastHit = (now.getTime() - lastRef) / 86_400_000;
+
+    const [{ hits }] = await sql<{ hits: number }[]>`
+      SELECT count(*)::int AS hits
+      FROM tech_signal_cards
+      WHERE ${node.id} = ANY(l3_ids)
+        AND created_at >= now() - interval '45 days'
+        AND (engineering_score >= 70 OR frontier_score >= 75)`;
+
+    const next = evaluateLifecycleTransition({
+      level: node.level,
+      lifecycleStatus: node.lifecycleStatus,
+      pinned: node.pinned,
+      daysSinceCreated,
+      daysSinceLastHit,
+      recentHighValueHits: hits ?? 0,
+    });
+    if (!next) continue;
+
+    const legacyStatus = next === "dormant" ? "archived" : "active";
+    await sql`
+      UPDATE tech_taxonomy_nodes
+      SET lifecycle_status = ${next}, status = ${legacyStatus}, updated_at = now()
+      WHERE id = ${node.id}`;
+    decisions.push({
+      nodeId: node.id,
+      from: node.lifecycleStatus,
+      to: next,
+      reason: next === "dormant" ? `silent ${Math.round(daysSinceLastHit)}d` : `sustained ${hits} high-value hits`,
+    });
+  }
+
+  return decisions;
 }
 
 export async function listPendingL3Proposals(): Promise<L3Proposal[]> {
@@ -97,8 +236,8 @@ export async function listPendingL3Proposals(): Promise<L3Proposal[]> {
 }
 
 /**
- * Human-in-the-loop governance: approve an auto-discovered L3 proposal and promote it into
- * the active 3-layer taxonomy tree, or merge/reject it.
+ * Human-in-the-loop governance: newly approved L3 proposals enter `incubating` first
+ * (30-60d trial) before graduating to `active`.
  */
 export async function reviewL3Proposal(input: {
   proposalId: string;
@@ -128,8 +267,8 @@ export async function reviewL3Proposal(input: {
       definition: input.definition ?? proposal.proposed_definition,
       includeExamples: [],
       excludeBoundaries: [],
-      attentionWeight: input.attentionWeight ?? "watch",
-      status: "active",
+      attentionWeight: input.attentionWeight ?? "core",
+      lifecycleStatus: "incubating",
     });
     await sql`
       UPDATE tech_l3_proposals

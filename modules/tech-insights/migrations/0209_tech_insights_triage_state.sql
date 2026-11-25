@@ -1,0 +1,1 @@
+ALTER TABLE tech_article_triage ADD COLUMN IF NOT EXISTS triage_state text NOT NULL DEFAULT 'OPEN_TOPIC_CANDIDATE';
