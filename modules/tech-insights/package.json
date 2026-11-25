@@ -1,0 +1,16 @@
+{
+  "name": "@aihot/tech-insights",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./module.ts",
+    "./module": "./module.ts",
+    "./server": "./server.ts",
+    "./web": "./web.tsx",
+    "./types": "./types.ts"
+  },
+  "dependencies": {
+    "@aihot/backend": "*",
+    "@aihot/contracts": "*"
+  }
+}
